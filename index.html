@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>立方体お絵描き採点</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;background:#f5f7fa;color:#222}
+  .wrap{max-width:1050px;margin:auto;padding:18px}
+  h1{margin:0 0 8px;font-size:24px}
+  .desc{margin:0 0 14px;color:#555}
+  .tabs{display:flex;gap:8px;margin-bottom:10px}
+  button{border:0;border-radius:10px;padding:10px 15px;font-size:15px;cursor:pointer;background:#ddd;color:#222}
+  button.active{background:#222;color:#fff}
+  .panel{background:#fff;border-radius:16px;padding:12px;box-shadow:0 2px 12px #0001}
+  canvas{display:block;width:100%;height:auto;aspect-ratio:1.5;border:2px solid #ccd3dc;border-radius:12px;background:#fff;touch-action:none}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  #score{font-size:34px;font-weight:800;margin-top:12px}
+  #rank{font-size:15px;color:#555;margin-bottom:6px}
+  .row{margin:8px 0}
+  .row .top{display:flex;justify-content:space-between;font-size:14px}
+  .bar{height:8px;background:#e6eaf0;border-radius:4px;overflow:hidden;margin-top:3px}
+  .bar i{display:block;height:100%}
+  .note{font-size:12px;color:#777;margin-top:2px}
+  .hint{font-size:14px;color:#666}
+  .warn{color:#b42318;font-size:14px;margin-top:6px}
+  .legend{font-size:12px;color:#666;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>立方体の正確さチェッカー</h1>
+  <p class="desc">マウスでも指でもペンでも描けます。2種類の採点方式を試せます(採点の基準は共通です)。</p>
+
+  <div class="tabs">
+    <button id="tab12" class="active">① 12本の辺を1本ずつ</button>
+    <button id="tabFree">② 自由に描く</button>
+  </div>
+
+  <div class="panel">
+    <p id="modeText" class="hint"></p>
+    <canvas id="cv" width="1200" height="800"></canvas>
+    <div class="controls">
+      <button id="clear">消去</button>
+      <button id="undo">1本戻す</button>
+      <button id="sample">見本を表示</button>
+      <button id="judge">採点</button>
+    </div>
+    <div id="score"></div>
+    <div id="rank"></div>
+    <div id="detail"></div>
+    <div id="warn" class="warn"></div>
+    <div id="legend" class="legend"></div>
+  </div>
+</div>
+
+<script>
+/* ===================== 採点コア(DOM非依存) ===================== */
+/*CORE_START*/
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const lin=(x,good,bad)=>Math.max(0,Math.min(100,100*(bad-x)/(bad-good))); // good以下=100点, bad以上=0点
+const pathLen=s=>{let t=0;for(let i=1;i<s.length;i++)t+=dist(s[i-1],s[i]);return t};
+
+function resample(s,n){
+  const d=[0];for(let i=1;i<s.length;i++)d.push(d[i-1]+dist(s[i-1],s[i]));
+  const total=d[d.length-1];
+  if(total===0||s.length<2)return [s[0]];
+  const out=[];let j=1;
+  for(let k=0;k<n;k++){
+    const t=total*k/(n-1);
+    while(j<d.length-1&&d[j]<t)j++;
+    const seg=d[j]-d[j-1]||1,u=(t-d[j-1])/seg;
+    out.push({x:s[j-1].x+(s[j].x-s[j-1].x)*u,y:s[j-1].y+(s[j].y-s[j-1].y)*u});
+  }
+  return out;
+}
+function segDist(p,a,b){
+  const dx=b.x-a.x,dy=b.y-a.y,l2=dx*dx+dy*dy;
+  if(!l2)return dist(p,a);
+  const t=Math.max(0,Math.min(1,((p.x-a.x)*dx+(p.y-a.y)*dy)/l2));
+  return dist(p,{x:a.x+t*dx,y:a.y+t*dy});
+}
+// Douglas-Peucker(インデックスを返す)
+function rdp(pts,i0,i1,eps,out){
+  let md=0,mi=-1;
+  for(let i=i0+1;i<i1;i++){const d=segDist(pts[i],pts[i0],pts[i1]);if(d>md){md=d;mi=i}}
+  if(md>eps){rdp(pts,i0,mi,eps,out);rdp(pts,mi,i1,eps,out)}else out.push(i1);
+}
+function makeEdge(pts){
+  const a=pts[0],b=pts[pts.length-1],L=dist(a,b);
+  let sq=0;for(const p of pts){const d=segDist(p,a,b);sq+=d*d}
+  const rms=Math.sqrt(sq/pts.length);
+  return {a,b,L,rms,dev:L?rms/L:1,ang:Math.atan2(b.y-a.y,b.x-a.x)};
+}
+// モード'12': 1ストローク=1辺 / モード'free': ストロークを折れ点で分割して辺にする
+function edgesFrom(strokes,mode){
+  const edges=[];
+  for(const s of strokes){
+    if(mode==='12'){
+      edges.push(makeEdge(resample(s,40)));
+    }else{
+      const len=pathLen(s);
+      const rs=resample(s,Math.max(8,Math.round(len/4)));
+      const idx=[0];rdp(rs,0,rs.length-1,16,idx);
+      for(let i=0;i<idx.length-1;i++){
+        const seg=rs.slice(idx[i],idx[i+1]+1);
+        if(seg.length>=2)edges.push(makeEdge(seg));
+      }
+    }
+  }
+  return edges.filter(e=>e.L>=20);
+}
+
+// 辺の向き(0〜180°の「線の向き」)を3グループに分ける。全ての3つ組を初期値にして最良を採用
+function groupDirections(edges){
+  const n=edges.length;
+  const v=edges.map(e=>({c:Math.cos(2*e.ang),s:Math.sin(2*e.ang)}));
+  const devDeg=(p,c)=>Math.acos(Math.max(-1,Math.min(1,p.c*c.c+p.s*c.s)))*90/Math.PI; // 線の向きの差(度)
+  const cand=[...Array(n).keys()].sort((i,j)=>edges[j].L-edges[i].L).slice(0,28);
+  let best=null;
+  for(let a=0;a<cand.length;a++)for(let b=a+1;b<cand.length;b++)for(let c=b+1;c<cand.length;c++){
+    let cen=[v[cand[a]],v[cand[b]],v[cand[c]]].map(x=>({...x}));
+    let asg=new Array(n).fill(0);
+    for(let it=0;it<4;it++){
+      for(let i=0;i<n;i++){let bd=1e9;for(let k=0;k<3;k++){const d=devDeg(v[i],cen[k]);if(d<bd){bd=d;asg[i]=k}}}
+      for(let k=0;k<3;k++){
+        let sc=0,ss=0,m=0;
+        for(let i=0;i<n;i++)if(asg[i]===k){sc+=v[i].c;ss+=v[i].s;m++}
+        if(m){const h=Math.hypot(sc,ss)||1;cen[k]={c:sc/h,s:ss/h}}
+      }
+    }
+    let cost=0;for(let i=0;i<n;i++)cost+=devDeg(v[i],cen[asg[i]]);
+    cost/=n;
+    if(!best||cost<best.cost)best={cost,asg:asg.slice(),cen:cen.map(x=>({...x}))};
+  }
+  const ang=best.cen.map(c=>Math.atan2(c.s,c.c)/2*180/Math.PI);
+  let minSep=180;
+  for(let i=0;i<3;i++)for(let j=i+1;j<3;j++){let d=Math.abs(ang[i]-ang[j])%180;d=Math.min(d,180-d);minSep=Math.min(minSep,d)}
+  const sizes=[0,0,0];best.asg.forEach(k=>sizes[k]++);
+  return {asg:best.asg,meanDev:best.cost,sizes,minSep,ang};
+}
+
+// 端点をまとめて「頂点」を作る
+function clusterVertices(edges){
+  const meanL=edges.reduce((a,e)=>a+e.L,0)/edges.length;
+  const r=Math.max(15,meanL*0.15);
+  const ends=[];edges.forEach((e,i)=>{ends.push({p:e.a,i},{p:e.b,i})});
+  const cl=[];
+  const centroid=c=>{c.x=c.m.reduce((a,q)=>a+q.p.x,0)/c.m.length;c.y=c.m.reduce((a,q)=>a+q.p.y,0)/c.m.length};
+  for(const q of ends){
+    let bi=-1,bd=r;
+    cl.forEach((c,i)=>{const d=dist(q.p,c);if(d<bd){bd=d;bi=i}});
+    if(bi<0){cl.push({x:q.p.x,y:q.p.y,m:[q]})}else{cl[bi].m.push(q);centroid(cl[bi])}
+  }
+  // 各端点から「別の辺の端点」までの最短距離(つながっていない端点ほど大きい)
+  let snap=0;
+  for(const q of ends){
+    let md=meanL*0.5;
+    for(const o of ends)if(o.i!==q.i)md=Math.min(md,dist(q.p,o.p));
+    snap+=md;
+  }
+  return {cl,snapRatio:snap/ends.length/meanL,meanL};
+}
+
+function analyze(edges){
+  if(edges.length<8)return {error:'辺が少なすぎます(検出 '+edges.length+' 本)。立方体は12本の辺でできています。'};
+  const g=groupDirections(edges);
+  const vt=clusterVertices(edges);
+
+  // ① 直線性: 線のブレ(RMS)/長さ
+  const straightDev=edges.reduce((a,e)=>a+e.dev,0)/edges.length;
+  // ② 平行性: 同じグループの辺の向きのズレ(度)
+  // ③ 構成: 3方向×各4本になっているか
+  const sizeDev=g.sizes.reduce((a,s)=>a+Math.abs(s-4),0);
+  // ④ 長さ: 平行な辺どうしの長さのバラつき(変動係数)。透視・斜投影での縮みは許容
+  let cvSum=0,cvN=0;
+  for(let k=0;k<3;k++){
+    const Ls=edges.filter((_,i)=>g.asg[i]===k).map(e=>e.L);
+    if(Ls.length>=2){
+      const m=Ls.reduce((a,b)=>a+b,0)/Ls.length;
+      const sd=Math.sqrt(Ls.reduce((a,b)=>a+(b-m)**2,0)/Ls.length);
+      cvSum+=sd/m*Ls.length;cvN+=Ls.length;
+    }
+  }
+  const cv=cvN?cvSum/cvN:1;
+  // ⑤ 接続: 端点が頂点にどれだけ揃っているか(辺の平均長に対する割合)
+  // ⑥ 頂点構造: 8頂点・各頂点に3本
+  const deg=vt.cl.map(c=>c.m.length);
+  const D=deg.reduce((a,d)=>a+Math.abs(d-3),0)+3*Math.max(0,8-deg.length);
+
+  const items=[
+    {key:'straight',label:'直線性',w:20,score:lin(straightDev,0.005,0.04),note:'線がまっすぐか'},
+    {key:'parallel',label:'平行性',w:25,score:lin(g.meanDev,2,15),note:'平均 '+g.meanDev.toFixed(1)+'° のズレ'},
+    {key:'struct',label:'3方向×4本の構成',w:10,score:lin(sizeDev,1,8),note:'各方向の本数 '+g.sizes.join(' / ')},
+    {key:'length',label:'平行な辺の長さの揃い',w:15,score:lin(cv,0.05,0.35),note:'ばらつき '+(cv*100).toFixed(0)+'%'},
+    {key:'conn',label:'頂点のつながり',w:15,score:lin(vt.snapRatio,0.03,0.20),note:'端点のズレ 辺長の'+(vt.snapRatio*100).toFixed(0)+'%'},
+    {key:'vertex',label:'頂点の構造(8個・各3本)',w:15,score:lin(D,0,12),note:'頂点 '+deg.length+' 個'}
+  ];
+  items.forEach(i=>i.score=Math.round(i.score));
+  let total=items.reduce((a,i)=>a+i.w*i.score/100,0);
+  let warn='';
+  if(g.minSep<20){total=Math.min(total,40);warn='辺の向きが3方向に分かれていません(最小の角度差 '+g.minSep.toFixed(0)+'°)。立方体に見える図になっていない可能性があります。'}
+  return {total:Math.round(total),items,warn,edges,g,vt};
+}
+/*CORE_END*/
+
+/* ===================== UI ===================== */
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+let mode='12',drawing=false,strokes=[],cur=[],sampleOn=false,result=null;
+const GROUP_COL=['#d92d20','#1570ef','#16a34a'];
+
+function pos(e){
+  const r=cv.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height};
+}
+function drawStroke(s){
+  if(!s.length)return;
+  ctx.beginPath();ctx.moveTo(s[0].x,s[0].y);
+  for(const p of s.slice(1))ctx.lineTo(p.x,p.y);
+  ctx.stroke();
+}
+function redraw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(sampleOn)drawSample();
+  ctx.lineCap='round';ctx.lineJoin='round';ctx.lineWidth=7;
+  ctx.strokeStyle=result?'#c5ccd6':'#222';
+  for(const s of strokes)drawStroke(s);
+  if(cur.length){ctx.strokeStyle='#222';drawStroke(cur)}
+  if(result&&!result.error)drawOverlay();
+}
+function drawOverlay(){
+  ctx.lineWidth=4;
+  result.edges.forEach((e,i)=>{
+    ctx.strokeStyle=GROUP_COL[result.g.asg[i]];
+    ctx.beginPath();ctx.moveTo(e.a.x,e.a.y);ctx.lineTo(e.b.x,e.b.y);ctx.stroke();
+  });
+  for(const c of result.vt.cl){
+    ctx.beginPath();ctx.arc(c.x,c.y,9,0,Math.PI*2);
+    ctx.fillStyle=c.m.length===3?'#16a34a':'#f59e0b';ctx.fill();
+    ctx.lineWidth=2;ctx.strokeStyle='#fff';ctx.stroke();
+  }
+}
+function drawSample(){
+  // 手前の正方形と、右上にずらした奥の正方形(斜投影の立方体)
+  const P=[{x:220,y:330},{x:560,y:330},{x:560,y:670},{x:220,y:670},
+           {x:430,y:190},{x:770,y:190},{x:770,y:530},{x:430,y:530}];
+  const E=[[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+  ctx.save();ctx.lineWidth=4;ctx.strokeStyle='#9aa5b4';ctx.setLineDash([12,10]);
+  for(const [a,b] of E){ctx.beginPath();ctx.moveTo(P[a].x,P[a].y);ctx.lineTo(P[b].x,P[b].y);ctx.stroke()}
+  ctx.restore();
+}
+
+function start(e){
+  if(mode==='12'&&strokes.length>=12){showMsg('12本描き終わりました。「1本戻す」か「消去」を使ってください。');return}
+  e.preventDefault();cv.setPointerCapture(e.pointerId);
+  result=null;clearResultUI();
+  drawing=true;cur=[pos(e)];redraw();
+}
+function move(e){if(!drawing)return;e.preventDefault();cur.push(pos(e));redraw()}
+function end(e){
+  if(!drawing)return;e.preventDefault();drawing=false;
+  if(pathLen(cur)>25)strokes.push(cur);   // タップなど短すぎる線は無視
+  cur=[];redraw();
+  if(mode==='12'){
+    if(strokes.length>=12)judge();else showMsg(strokes.length+' / 12 本');
+  }
+}
+cv.addEventListener('pointerdown',start);
+cv.addEventListener('pointermove',move);
+cv.addEventListener('pointerup',end);
+cv.addEventListener('pointercancel',end);
+
+function clearResultUI(){
+  for(const id of ['score','rank','detail','warn','legend'])document.getElementById(id).innerHTML='';
+}
+function showMsg(t){clearResultUI();document.getElementById('warn').textContent=t}
+function rankText(t){
+  return t>=90?'とても正確な立方体です':t>=75?'かなり良い立方体です':t>=60?'立方体に見えます。少し歪みがあります':t>=40?'歪みが大きめです':'立方体としては大きく崩れています';
+}
+function judge(){
+  clearResultUI();
+  if(mode==='12'&&strokes.length<12){showMsg('あと '+(12-strokes.length)+' 本足りません。');result=null;redraw();return}
+  if(!strokes.length){showMsg('まず立方体を描いてください。');return}
+  result=analyze(edgesFrom(strokes,mode));
+  redraw();
+  if(result.error){showMsg(result.error);return}
+  document.getElementById('score').textContent=result.total+' 点';
+  document.getElementById('rank').textContent=rankText(result.total);
+  document.getElementById('detail').innerHTML=result.items.map(i=>{
+    const col=i.score>=75?'#16a34a':i.score>=50?'#f59e0b':'#d92d20';
+    return `<div class="row"><div class="top"><span>${i.label}(配点${i.w})</span><b>${i.score}</b></div>
+      <div class="bar"><i style="width:${i.score}%;background:${col}"></i></div><div class="note">${i.note}</div></div>`;
+  }).join('');
+  document.getElementById('warn').textContent=result.warn;
+  document.getElementById('legend').innerHTML='判定表示:線の色は検出した3方向(赤・青・緑)、丸は頂点(緑=3本が集まる / 橙=本数が違う)。';
+}
+
+function clearAll(){strokes=[];cur=[];result=null;clearResultUI();redraw()}
+document.getElementById('clear').onclick=clearAll;
+document.getElementById('undo').onclick=()=>{strokes.pop();result=null;clearResultUI();redraw()};
+document.getElementById('sample').onclick=()=>{sampleOn=!sampleOn;redraw()};
+document.getElementById('judge').onclick=judge;
+
+function setMode(m){
+  mode=m;
+  document.getElementById('tab12').classList.toggle('active',m==='12');
+  document.getElementById('tabFree').classList.toggle('active',m==='free');
+  document.getElementById('modeText').textContent=m==='12'
+    ?'1本の辺を1ストロークで描きます。12本描くと自動採点します。'
+    :'本数や描き順は自由です(折れ線で続けて描いてもOK)。描き終えたら「採点」を押してください。';
+  clearAll();
+}
+document.getElementById('tab12').onclick=()=>setMode('12');
+document.getElementById('tabFree').onclick=()=>setMode('free');
+setMode('12');
+</script>
+</body>
+</html>
